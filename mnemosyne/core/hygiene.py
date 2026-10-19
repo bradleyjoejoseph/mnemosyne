@@ -145,6 +145,16 @@ def _hygiene_delete_cascade(
         ).fetchone()
         if gists_table is not None:
             cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+        still_owned = cursor.execute(
+            "SELECT 1 FROM working_memory WHERE id = ? "
+            "UNION ALL SELECT 1 FROM episodic_memory WHERE id = ? LIMIT 1",
+            (memory_id, memory_id),
+        ).fetchone()
+        if still_owned is None:
+            from mnemosyne.core.beam import BeamMemory
+
+            BeamMemory._delete_derived_memory_rows(cursor, memory_id)
+            BeamMemory._delete_orphaned_legacy_mirror(cursor, memory_id)
     except Exception:
         cursor.execute("ROLLBACK TO SAVEPOINT hygiene_delete")
         cursor.execute("RELEASE hygiene_delete")

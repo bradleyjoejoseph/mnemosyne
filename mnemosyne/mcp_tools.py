@@ -675,6 +675,8 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
                 if gists_table is not None:
                     conn.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
                 conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
+                target_beam._delete_derived_memory_rows(conn, memory_id)
+                target_beam._delete_orphaned_legacy_mirror(conn, memory_id)
             elif action == "update":
                 conn.execute(
                     "UPDATE working_memory SET content = ?, validator = ?, "

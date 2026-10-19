@@ -6991,16 +6991,12 @@ class BeamMemory:
         # (keyed by rowid) and the memory_embeddings fallback (keyed by id)
         # are cleared here for the same rows: the trim set is read once
         # and every delete uses it.
-        owner_tables = ["episodic_memory"]
-        if self.conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memories'"
-        ).fetchone() is not None:
-            owner_tables.append("memories")
         # memory_embeddings carries only memory_id: keep the row while an
-        # episodic or legacy parent owns the same id (#1002).
-        other_owner = "".join(
-            f" AND NOT EXISTS (SELECT 1 FROM {table} WHERE {table}.id = memory_embeddings.memory_id)"
-            for table in owner_tables
+        # episodic parent owns the same id (#1002). The legacy ``memories``
+        # mirror is not a parent tier (#1126).
+        other_owner = (
+            " AND NOT EXISTS (SELECT 1 FROM episodic_memory "
+            "WHERE episodic_memory.id = memory_embeddings.memory_id)"
         )
         owns_transaction = not self.conn.in_transaction
         savepoint = None
@@ -7044,6 +7040,16 @@ class BeamMemory:
                     "DELETE FROM memory_embeddings WHERE memory_id = ?" + other_owner,
                     [(row[1],) for row in trimmed],
                 )
+                # A trimmed id can still be owned by an episodic parent, in
+                # which case its derived rows stay with that tier. Otherwise
+                # the derived voices and the legacy mirror go with the row,
+                # matching the explicit-forget contract (#1131, #1035, #1126).
+                for (mid,) in [(row[1],) for row in trimmed]:
+                    if self.conn.execute(
+                        "SELECT 1 FROM episodic_memory WHERE id = ? LIMIT 1", (mid,)
+                    ).fetchone() is None:
+                        BeamMemory._delete_derived_memory_rows(self.conn, mid)
+                        BeamMemory._delete_orphaned_legacy_mirror(self.conn, mid)
             # Inside the try: a failed commit (e.g. a deferred foreign key)
             # rolls all three deletes back instead of leaving them staged.
             if savepoint is None:
@@ -7778,6 +7784,57 @@ class BeamMemory:
         return None
 
     @staticmethod
+    def _delete_orphaned_legacy_mirror(cursor, memory_id: str) -> None:
+        """Drop the legacy ``memories`` mirror once no BEAM tier owns the id.
+
+        The mirror exists for old readers and is not a parent tier. Treating
+        it as one made a tier-scoped forget retain every child forever, because
+        no BEAM path removes the mirror (#1126). Delete it only after both tier
+        tables are free of the id, so a surviving tier keeps its representation.
+        """
+        if cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memories'"
+        ).fetchone() is None:
+            return
+        still_owned = cursor.execute(
+            "SELECT 1 FROM working_memory WHERE id = ? "
+            "UNION ALL SELECT 1 FROM episodic_memory WHERE id = ? LIMIT 1",
+            (memory_id, memory_id),
+        ).fetchone()
+        if still_owned is None:
+            cursor.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+
+    @staticmethod
+    def _delete_derived_memory_rows(cursor, memory_id: str) -> None:
+        """Delete rows derived from a memory id that has no surviving parent.
+
+        ``memoria_*`` rows carry ``source_memory_id`` and ``facts`` carries
+        ``source_msg_id`` (the extraction paths store the memory id there).
+        Neither was reached by the old cascade, so forgotten content stayed
+        retrievable through the memoria and fact voices (#1131, #1035).
+        """
+        existing = {
+            row[0]
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        for table in (
+            "memoria_facts",
+            "memoria_timelines",
+            "memoria_instructions",
+            "memoria_preferences",
+            "memoria_kg",
+            "memoria_persona",
+        ):
+            if table in existing:
+                cursor.execute(
+                    f"DELETE FROM {table} WHERE source_memory_id = ?", (memory_id,)
+                )
+        if "facts" in existing:
+            cursor.execute("DELETE FROM facts WHERE source_msg_id = ?", (memory_id,))
+
+    @staticmethod
     def _delete_unambiguous_memory_children(cursor, memory_id: str) -> None:
         """Delete child rows after the caller proves no other tier owns the ID.
 
@@ -7794,6 +7851,7 @@ class BeamMemory:
         ).fetchone()
         if gists_table is not None:
             cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+        BeamMemory._delete_derived_memory_rows(cursor, memory_id)
 
     def forget_working(self, memory_id: str) -> bool:
         """Delete an authorized working row without crossing tier ownership.
@@ -7820,16 +7878,6 @@ class BeamMemory:
                 "SELECT 1 FROM episodic_memory WHERE id = ? LIMIT 1",
                 (memory_id,),
             ).fetchone()
-            if competing_parent is None:
-                legacy_table = cursor.execute(
-                    "SELECT 1 FROM sqlite_master "
-                    "WHERE type = 'table' AND name = 'memories'"
-                ).fetchone()
-                if legacy_table is not None:
-                    competing_parent = cursor.execute(
-                        "SELECT 1 FROM memories WHERE id = ? LIMIT 1",
-                        (memory_id,),
-                    ).fetchone()
             if authorized_row is not None and _wm_vec_available(self.conn):
                 cursor.execute("DELETE FROM vec_working WHERE rowid = ?", (int(authorized_row["rowid"]),))
             cursor.execute(
@@ -7839,6 +7887,8 @@ class BeamMemory:
             wm_rows = cursor.rowcount
             if wm_rows > 0 and competing_parent is None:
                 self._delete_unambiguous_memory_children(cursor, memory_id)
+            if wm_rows > 0:
+                self._delete_orphaned_legacy_mirror(cursor, memory_id)
         forgotten = wm_rows > 0
         if forgotten:
             if owns_transaction:
@@ -7871,16 +7921,6 @@ class BeamMemory:
                 "SELECT 1 FROM working_memory WHERE id = ? LIMIT 1",
                 (memory_id,),
             ).fetchone()
-            if competing_parent is None:
-                legacy_table = cursor.execute(
-                    "SELECT 1 FROM sqlite_master "
-                    "WHERE type = 'table' AND name = 'memories'"
-                ).fetchone()
-                if legacy_table is not None:
-                    competing_parent = cursor.execute(
-                        "SELECT 1 FROM memories WHERE id = ? LIMIT 1",
-                        (memory_id,),
-                    ).fetchone()
             if authorized_row is not None and _vec_available(self.conn):
                 cursor.execute(
                     "DELETE FROM vec_episodes WHERE rowid = ?",
@@ -7894,6 +7934,8 @@ class BeamMemory:
             episodic_rows = cursor.rowcount
             if episodic_rows > 0 and competing_parent is None:
                 self._delete_unambiguous_memory_children(cursor, memory_id)
+            if episodic_rows > 0:
+                self._delete_orphaned_legacy_mirror(cursor, memory_id)
         forgotten = episodic_rows > 0
         if forgotten:
             if owns_transaction:
