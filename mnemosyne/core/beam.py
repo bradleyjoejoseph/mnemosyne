@@ -7793,6 +7793,31 @@ class BeamMemory:
         return None
 
     @staticmethod
+    def _memory_has_surviving_parent(cursor, memory_id: str) -> bool:
+        """True when a working or episodic row still owns the id.
+
+        Partial schemas (relay databases, focused tests) may omit a tier
+        table, so probe only the tables that exist rather than assuming both.
+        """
+        existing = {
+            row[0]
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        checks = [
+            f"SELECT 1 FROM {table} WHERE id = ?"
+            for table in ("working_memory", "episodic_memory")
+            if table in existing
+        ]
+        if not checks:
+            return False
+        return cursor.execute(
+            " UNION ALL ".join(checks) + " LIMIT 1",
+            tuple(memory_id for _ in checks),
+        ).fetchone() is not None
+
+    @staticmethod
     def _memory_parent_exists(conn, memory_id: str) -> bool:
         """True when a BEAM tier still owns the id.
 
@@ -7800,11 +7825,7 @@ class BeamMemory:
         this immediately before inserting, not only at the start of the
         operation, so a completed delete cannot be followed by a new child row.
         """
-        return conn.execute(
-            "SELECT 1 FROM working_memory WHERE id = ? "
-            "UNION ALL SELECT 1 FROM episodic_memory WHERE id = ? LIMIT 1",
-            (memory_id, memory_id),
-        ).fetchone() is not None
+        return BeamMemory._memory_has_surviving_parent(conn, memory_id)
 
     @staticmethod
     def _delete_orphaned_legacy_mirror(cursor, memory_id: str) -> None:
@@ -7819,12 +7840,7 @@ class BeamMemory:
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memories'"
         ).fetchone() is None:
             return
-        still_owned = cursor.execute(
-            "SELECT 1 FROM working_memory WHERE id = ? "
-            "UNION ALL SELECT 1 FROM episodic_memory WHERE id = ? LIMIT 1",
-            (memory_id, memory_id),
-        ).fetchone()
-        if still_owned is None:
+        if not BeamMemory._memory_has_surviving_parent(cursor, memory_id):
             cursor.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
 
     @staticmethod
