@@ -3048,6 +3048,8 @@ def _extract_and_store_entities(beam: "BeamMemory", memory_id: str, content: str
     multiple mentions per memory coexist.
     """
     try:
+        if not beam._memory_parent_exists(beam.conn, memory_id):
+            return
         from mnemosyne.core.entities import extract_entities_regex
 
         entities = extract_entities_regex(content)
@@ -3089,6 +3091,8 @@ def _extract_and_store_facts(
     coexist.
     """
     try:
+        if not beam._memory_parent_exists(beam.conn, memory_id):
+            return
         from mnemosyne.core.annotations import filter_facts
         from mnemosyne.core.extraction import (
             extract_facts_safe,
@@ -6752,6 +6756,11 @@ class BeamMemory:
         """Phase 3-4: Extract gists + facts, store in graph, consolidate veracity.
         Non-blocking -- failures in graph/veracity don't affect memory storage."""
 
+        if not self._memory_parent_exists(self.conn, memory_id):
+            # A paused remember() can resume after forget(); do not recreate
+            # annotations, gists or facts for a row that no longer exists.
+            return
+
         gist = None
         facts = []
 
@@ -7782,6 +7791,20 @@ class BeamMemory:
             }
 
         return None
+
+    @staticmethod
+    def _memory_parent_exists(conn, memory_id: str) -> bool:
+        """True when a BEAM tier still owns the id.
+
+        Enrichment can resume after a forget (#1100). Child writes must check
+        this immediately before inserting, not only at the start of the
+        operation, so a completed delete cannot be followed by a new child row.
+        """
+        return conn.execute(
+            "SELECT 1 FROM working_memory WHERE id = ? "
+            "UNION ALL SELECT 1 FROM episodic_memory WHERE id = ? LIMIT 1",
+            (memory_id, memory_id),
+        ).fetchone() is not None
 
     @staticmethod
     def _delete_orphaned_legacy_mirror(cursor, memory_id: str) -> None:

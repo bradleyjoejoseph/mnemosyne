@@ -207,3 +207,34 @@ def test_trim_deletes_derived_rows_for_trimmed_ids(tmp_path, monkeypatch):
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
     ).fetchone()[0] == 0
     assert set(_count_derived(memory, memory_id).values()) == {0}
+
+
+def test_delayed_entity_extraction_after_forget_writes_nothing(tmp_path):
+    memory = _make_beam(tmp_path)
+    live = memory.remember("Abdias likes Mnemosyne", scope="global")
+    before = _count(memory, "SELECT COUNT(*) FROM annotations WHERE memory_id = ?", live)
+    beam._extract_and_store_entities(memory, live, "Abdias likes Mnemosyne")
+    assert _count(memory, "SELECT COUNT(*) FROM annotations WHERE memory_id = ?", live) > before
+
+    memory_id = memory.remember("Abdias likes Mnemosyne again", scope="global")
+    assert memory.forget_working(memory_id) is True
+    beam._extract_and_store_entities(memory, memory_id, "Abdias likes Mnemosyne")
+    assert _count(
+        memory, "SELECT COUNT(*) FROM annotations WHERE memory_id = ?", memory_id
+    ) == 0
+
+
+def test_delayed_graph_enrichment_after_forget_writes_nothing(tmp_path):
+    memory = _make_beam(tmp_path)
+    if memory.episodic_graph is None:
+        import pytest
+
+        pytest.skip("episodic graph unavailable")
+    live = memory.remember("Abdias met Maya in Berlin", scope="global")
+    memory._ingest_graph_and_veracity(live, "Abdias met Maya in Berlin", "test")
+    assert _count(memory, "SELECT COUNT(*) FROM gists WHERE memory_id = ?", live) > 0
+
+    memory_id = memory.remember("Abdias met Maya in Rome", scope="global")
+    assert memory.forget_working(memory_id) is True
+    memory._ingest_graph_and_veracity(memory_id, "Abdias met Maya in Rome", "test")
+    assert _count(memory, "SELECT COUNT(*) FROM gists WHERE memory_id = ?", memory_id) == 0
